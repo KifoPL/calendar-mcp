@@ -66,6 +66,15 @@ public static partial class DavHostPolicy
     }
 
     /// <summary>
+    /// Parses an enableCalendar/enableContacts flag: "true" (any case) or "1" enable, any other
+    /// value disables, and a missing value takes <paramref name="defaultValue"/>.
+    /// </summary>
+    public static bool IsEnabled(string? value, bool defaultValue) =>
+        string.IsNullOrWhiteSpace(value)
+            ? defaultValue
+            : value.Equals("true", StringComparison.OrdinalIgnoreCase) || value == "1";
+
+    /// <summary>
     /// Returns true when <paramref name="uri"/> may receive credentials for the given preset.
     /// </summary>
     public static bool IsAllowedHost(Uri uri, string? preset, DavServiceKind kind, Uri? entryUri = null)

@@ -52,8 +52,8 @@ public sealed class DavProviderService : IDavProviderService
 
         var caldavUrl = Get(pc, "caldavUrl");
         var carddavUrl = Get(pc, "carddavUrl");
-        var enableCalendar = ParseBool(Get(pc, "enableCalendar"), defaultValue: !string.IsNullOrWhiteSpace(caldavUrl));
-        var enableContacts = ParseBool(Get(pc, "enableContacts"), defaultValue: !string.IsNullOrWhiteSpace(carddavUrl));
+        var enableCalendar = DavHostPolicy.IsEnabled(Get(pc, "enableCalendar"), defaultValue: !string.IsNullOrWhiteSpace(caldavUrl));
+        var enableContacts = DavHostPolicy.IsEnabled(Get(pc, "enableContacts"), defaultValue: !string.IsNullOrWhiteSpace(carddavUrl));
 
         if (!enableCalendar && !enableContacts)
             throw new InvalidOperationException(
@@ -73,10 +73,6 @@ public sealed class DavProviderService : IDavProviderService
 
         static string? Get(IDictionary<string, string> d, string key) =>
             d.TryGetValue(key, out var v) && !string.IsNullOrWhiteSpace(v) ? v : null;
-
-        static bool ParseBool(string? value, bool defaultValue) =>
-            value is null ? defaultValue : value.Equals("true", StringComparison.OrdinalIgnoreCase)
-                || value == "1";
     }
 
     private static Uri EntryUri(DavAccountConfig cfg, DavServiceKind kind)
@@ -138,26 +134,42 @@ public sealed class DavProviderService : IDavProviderService
         if (calendars.Count == 0)
             return [];
 
-        var targets = string.IsNullOrWhiteSpace(calendarId)
-            ? calendars
-            : calendars.Where(c => c.Id == calendarId).ToList();
+        // "primary"/"default" mean the same as an omitted calendarId: every calendar.
+        List<CalendarInfo> targets;
+        if (CalendarIdAliases.IsDefaultCalendar(calendarId))
+        {
+            targets = calendars;
+        }
+        else
+        {
+            targets = calendars.Where(c => c.Id == calendarId).ToList();
+            if (targets.Count == 0)
+                throw new ProviderOperationException(CalendarIdAliases.UnknownCalendarMessage(calendarId));
+        }
 
-        var start = startDate ?? DateTime.UtcNow.Date;
-        var end = endDate ?? start.AddDays(7);
+        // The bounds are UTC instants whatever their Kind (IProviderService contract).
+        var start = DateTime.SpecifyKind(startDate ?? DateTime.UtcNow.Date, DateTimeKind.Utc);
+        var end = DateTime.SpecifyKind(endDate ?? start.AddDays(7), DateTimeKind.Utc);
+        var windowStart = new DateTimeOffset(start);
+        var windowEnd = new DateTimeOffset(end);
         var entry = EntryUri(cfg, DavServiceKind.CalDav);
         var events = new List<CalendarEvent>();
 
         foreach (var cal in targets)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var calHref = DavResourceId.Decode(cal.Id);
+            // Servers evaluate floating and all-day times in their own zone, so ask for a day
+            // either side and filter on the mapped UTC range below.
             var report = await _http.ReportAsync(
                 calHref, cfg.Username, cfg.Password,
-                DavXml.CalendarQuery(start.ToUniversalTime(), end.ToUniversalTime()),
+                DavXml.CalendarQuery(start.AddDays(-1), end.AddDays(1)),
                 cfg.Preset, DavServiceKind.CalDav, entry, cancellationToken);
             EnsureHttpSuccess(report, "calendar-query");
 
             foreach (var item in DavXml.ParseMultiStatus(report.Body, report.FinalUri))
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 if (string.IsNullOrWhiteSpace(item.CalendarData))
                     continue;
 
@@ -165,15 +177,25 @@ public sealed class DavProviderService : IDavProviderService
                 if (calendar is null)
                     continue;
 
-                var eventId = DavResourceId.Encode(item.Href);
-                foreach (var (master, occurrence) in IcalMapper.ExpandInRange(calendar, start, end))
+                foreach (var expanded in IcalMapper.Expand(calendar, start, end, cancellationToken))
                 {
-                    events.Add(IcalMapper.ToCalendarEvent(master, accountId, cal.Id, eventId, occurrence));
+                    var mapped = IcalMapper.ToCalendarEvent(
+                        expanded.Event, accountId, cal.Id, DavEventId.Format(item.Href, expanded.RecurrenceKey),
+                        expanded.Occurrence, cfg.Username);
+                    if (mapped.Start < windowEnd && mapped.End > windowStart)
+                        events.Add(mapped);
+                }
+
+                // Keep only the earliest `count` events so a broad range can't grow the list unbounded.
+                if (count >= 0 && events.Count > count * 2 + 100)
+                {
+                    events.Sort((a, b) => a.Start.CompareTo(b.Start));
+                    events.RemoveRange(count, events.Count - count);
                 }
             }
         }
 
-        return events.OrderBy(e => e.Start).Take(count);
+        return events.OrderBy(e => e.Start).Take(count).ToList();
     }
 
     public async Task<CalendarEvent?> GetCalendarEventDetailsAsync(
@@ -184,19 +206,30 @@ public sealed class DavProviderService : IDavProviderService
         EnsureCalendar(cfg);
 
         var entry = EntryUri(cfg, DavServiceKind.CalDav);
-        var href = await ValidateCalendarResourceAsync(accountId, calendarId, eventId, cancellationToken);
-        var get = await _http.GetAsync(href, cfg.Username, cfg.Password, cfg.Preset,
+        var target = await ResolveEventAsync(accountId, calendarId, eventId, cancellationToken);
+        var get = await _http.GetAsync(target.Href, cfg.Username, cfg.Password, cfg.Preset,
             DavServiceKind.CalDav, entry, cancellationToken);
         if (get.StatusCode == HttpStatusCode.NotFound)
             return null;
         EnsureHttpSuccess(get, "get event");
 
         var calendar = IcalMapper.LoadCalendar(get.Body);
-        var evt = calendar?.Events.FirstOrDefault();
-        if (evt is null)
+        if (calendar is null)
             return null;
 
-        return IcalMapper.ToCalendarEvent(evt, accountId, calendarId, eventId);
+        if (target.RecurrenceKey is null)
+        {
+            var evt = IcalMapper.GetPrimaryEvent(calendar);
+            return evt is null
+                ? null
+                : IcalMapper.ToCalendarEvent(evt, accountId, target.CalendarId, eventId, ownerEmail: cfg.Username);
+        }
+
+        var occurrence = IcalMapper.FindOccurrence(calendar, target.RecurrenceKey);
+        return occurrence is null
+            ? null
+            : IcalMapper.ToCalendarEvent(occurrence.Value.Event, accountId, target.CalendarId, eventId,
+                occurrence.Value.Occurrence, cfg.Username);
     }
 
     public async Task<string> CreateEventAsync(
@@ -215,15 +248,20 @@ public sealed class DavProviderService : IDavProviderService
         var cfg = await ResolveConfigAsync(accountId);
         EnsureCalendar(cfg);
 
-        var calId = calendarId;
-        if (string.IsNullOrWhiteSpace(calId))
+        var calendars = await ListCalendarsAsync(accountId, cancellationToken);
+        CalendarInfo calendar;
+        if (CalendarIdAliases.IsDefaultCalendar(calendarId))
         {
-            var first = (await ListCalendarsAsync(accountId, cancellationToken)).FirstOrDefault(c => c.CanEdit)
-                ?? throw new InvalidOperationException($"Account '{accountId}' has no writable calendars.");
-            calId = first.Id;
+            calendar = calendars.FirstOrDefault(c => c.CanEdit)
+                ?? throw new ProviderOperationException($"Account '{accountId}' has no writable calendars.");
+        }
+        else
+        {
+            calendar = calendars.FirstOrDefault(c => c.Id == calendarId)
+                ?? throw new ProviderOperationException(CalendarIdAliases.UnknownCalendarMessage(calendarId));
         }
 
-        var calHref = await ValidateCalendarResourceAsync(accountId, calId, null, cancellationToken);
+        var calHref = DavResourceId.Decode(calendar.Id);
         var uid = Guid.NewGuid().ToString();
         var objectHref = new Uri(calHref, $"{uid}.ics");
         var ics = IcalMapper.BuildNewEventIcs(uid, subject, start, end, location, attendees, body, timeZone, isAllDay);
@@ -255,14 +293,15 @@ public sealed class DavProviderService : IDavProviderService
         EnsureCalendar(cfg);
 
         var entry = EntryUri(cfg, DavServiceKind.CalDav);
-        var href = await ValidateCalendarResourceAsync(accountId, calendarId, eventId, cancellationToken);
-        var get = await _http.GetAsync(href, cfg.Username, cfg.Password, cfg.Preset,
+        var target = await ResolveEventAsync(accountId, calendarId, eventId, cancellationToken);
+        RejectSingleOccurrence(target, "Updating");
+        var get = await _http.GetAsync(target.Href, cfg.Username, cfg.Password, cfg.Preset,
             DavServiceKind.CalDav, entry, cancellationToken);
         EnsureHttpSuccess(get, "get event for update");
 
         var updated = IcalMapper.ApplyUpdates(get.Body, subject, start, end, location, attendees, timeZone, isAllDay);
         var put = await _http.PutAsync(
-            href, cfg.Username, cfg.Password, updated, "text/calendar; charset=utf-8",
+            target.Href, cfg.Username, cfg.Password, updated, "text/calendar; charset=utf-8",
             cfg.Preset, DavServiceKind.CalDav, entry, ifMatch: get.Etag, cancellationToken);
         EnsureHttpSuccess(put, "update event");
     }
@@ -275,8 +314,29 @@ public sealed class DavProviderService : IDavProviderService
         EnsureCalendar(cfg);
 
         var entry = EntryUri(cfg, DavServiceKind.CalDav);
-        var href = await ValidateCalendarResourceAsync(accountId, calendarId, eventId, cancellationToken);
-        var del = await _http.DeleteAsync(href, cfg.Username, cfg.Password, cfg.Preset,
+        var target = await ResolveEventAsync(accountId, calendarId, eventId, cancellationToken);
+
+        if (target.RecurrenceKey is not null)
+        {
+            // One occurrence: exclude it from the series rather than deleting the whole resource.
+            var get = await _http.GetAsync(target.Href, cfg.Username, cfg.Password, cfg.Preset,
+                DavServiceKind.CalDav, entry, cancellationToken);
+            if (get.StatusCode == HttpStatusCode.NotFound)
+                return;
+            EnsureHttpSuccess(get, "get event for delete");
+
+            var remaining = IcalMapper.ExcludeOccurrence(get.Body, target.RecurrenceKey);
+            if (remaining is not null)
+            {
+                var put = await _http.PutAsync(
+                    target.Href, cfg.Username, cfg.Password, remaining, "text/calendar; charset=utf-8",
+                    cfg.Preset, DavServiceKind.CalDav, entry, ifMatch: get.Etag, cancellationToken);
+                EnsureHttpSuccess(put, "delete occurrence");
+                return;
+            }
+        }
+
+        var del = await _http.DeleteAsync(target.Href, cfg.Username, cfg.Password, cfg.Preset,
             DavServiceKind.CalDav, entry, ifMatch: null, cancellationToken);
         if (del.StatusCode != HttpStatusCode.NotFound)
             EnsureHttpSuccess(del, "delete event");
@@ -294,14 +354,15 @@ public sealed class DavProviderService : IDavProviderService
         EnsureCalendar(cfg);
 
         var entry = EntryUri(cfg, DavServiceKind.CalDav);
-        var href = await ValidateCalendarResourceAsync(accountId, calendarId, eventId, cancellationToken);
-        var get = await _http.GetAsync(href, cfg.Username, cfg.Password, cfg.Preset,
+        var target = await ResolveEventAsync(accountId, calendarId, eventId, cancellationToken);
+        RejectSingleOccurrence(target, "Responding to");
+        var get = await _http.GetAsync(target.Href, cfg.Username, cfg.Password, cfg.Preset,
             DavServiceKind.CalDav, entry, cancellationToken);
         EnsureHttpSuccess(get, "get event for respond");
 
         var updated = IcalMapper.ApplyPartStat(get.Body, cfg.Username, response);
         var put = await _http.PutAsync(
-            href, cfg.Username, cfg.Password, updated, "text/calendar; charset=utf-8",
+            target.Href, cfg.Username, cfg.Password, updated, "text/calendar; charset=utf-8",
             cfg.Preset, DavServiceKind.CalDav, entry, ifMatch: get.Etag, cancellationToken);
         EnsureHttpSuccess(put, "respond to event");
     }
@@ -475,25 +536,87 @@ public sealed class DavProviderService : IDavProviderService
             ?? throw new InvalidOperationException($"No writable address books found for account '{cfg.AccountId}'.");
     }
 
-    private async Task<Uri> ValidateCalendarResourceAsync(string accountId, string calendarId, string? eventId, CancellationToken cancellationToken)
+    /// <summary>
+    /// An event ID resolved against the account's discovered calendars: the calendar object
+    /// resource, the calendar it belongs to, and the occurrence when the ID names one.
+    /// </summary>
+    private sealed record EventTarget(Uri Href, string CalendarId, string? RecurrenceKey);
+
+    private const string InvalidEventIdMessage =
+        "The eventId is not a valid CalDAV event id; use an id from get_calendar_events.";
+
+    /// <summary>
+    /// Resolves an event ID, checking that it is a direct child of a discovered calendar. With a
+    /// default-calendar alias (or no calendarId) the calendar is the one that holds the event,
+    /// since the event-scoped tools pass "primary" when the caller names no calendar.
+    /// </summary>
+    private async Task<EventTarget> ResolveEventAsync(
+        string accountId, string? calendarId, string eventId, CancellationToken cancellationToken)
     {
+        var (resourceId, recurrenceKey) = DavEventId.Parse(eventId);
+        if (recurrenceKey is not null && !IcalMapper.TryParseRecurrenceKey(recurrenceKey, out _, out _))
+            throw new ProviderOperationException(InvalidEventIdMessage);
+
+        Uri resource;
+        try
+        {
+            resource = DavResourceId.Decode(resourceId);
+        }
+        catch (Exception ex) when (ex is FormatException or ArgumentException)
+        {
+            throw new ProviderOperationException(InvalidEventIdMessage, ex);
+        }
+
         var calendars = await ListCalendarsAsync(accountId, cancellationToken);
-        var calendar = calendars.FirstOrDefault(c => c.Id == calendarId)
-            ?? throw new InvalidOperationException("Calendar does not belong to this account's discovered collections.");
-        var collection = DavResourceId.Decode(calendar.Id);
-        if (eventId is null) return collection;
-        var resource = DavResourceId.Decode(eventId);
-        if (!IsCollectionChild(collection, resource))
-            throw new InvalidOperationException("Event does not belong to the selected calendar.");
-        return resource;
+        CalendarInfo calendar;
+        if (CalendarIdAliases.IsDefaultCalendar(calendarId))
+        {
+            calendar = calendars.FirstOrDefault(c => IsCollectionChild(DavResourceId.Decode(c.Id), resource))
+                ?? throw new ProviderOperationException(
+                    "The event is not in any calendar in this account; use an id from get_calendar_events.");
+        }
+        else
+        {
+            calendar = calendars.FirstOrDefault(c => c.Id == calendarId)
+                ?? throw new ProviderOperationException(CalendarIdAliases.UnknownCalendarMessage(calendarId));
+            if (!IsCollectionChild(DavResourceId.Decode(calendar.Id), resource))
+                throw new ProviderOperationException(
+                    "The event is not in the selected calendar; omit calendarId or use the calendarId returned with the event.");
+        }
+
+        return new EventTarget(resource, calendar.Id, recurrenceKey);
+    }
+
+    /// <summary>
+    /// Changing one occurrence needs an override VEVENT, which this provider doesn't write yet.
+    /// Refuse rather than silently changing every occurrence of the series.
+    /// </summary>
+    private static void RejectSingleOccurrence(EventTarget target, string action)
+    {
+        if (target.RecurrenceKey is null)
+            return;
+
+        throw new ProviderOperationException(
+            $"{action} a single occurrence of a recurring CalDAV event isn't supported. " +
+            $"To apply it to every occurrence, use the series eventId \"{DavResourceId.Encode(target.Href)}\".");
     }
 
     private async Task<Uri> ValidateContactResourceAsync(DavAccountConfig cfg, string contactId, CancellationToken cancellationToken)
     {
-        var resource = DavResourceId.Decode(contactId);
+        Uri resource;
+        try
+        {
+            resource = DavResourceId.Decode(contactId);
+        }
+        catch (Exception ex) when (ex is FormatException or ArgumentException)
+        {
+            throw new ProviderOperationException(
+                "The contactId is not a valid CardDAV contact id; use an id from get_contacts.", ex);
+        }
+
         var books = await ListAddressbooksAsync(cfg, cancellationToken);
         if (!books.Any(b => IsCollectionChild(b.Href, resource)))
-            throw new InvalidOperationException("Contact does not belong to this account's discovered address books.");
+            throw new ProviderOperationException("The contact is not in this account's address books.");
         return resource;
     }
 

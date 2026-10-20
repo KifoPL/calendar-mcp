@@ -2,6 +2,9 @@ using System.Globalization;
 using System.Text;
 using System.Text.RegularExpressions;
 using CalendarMcp.Core.Models;
+using CalendarMcp.Core.Services;
+using CalendarMcp.Core.Tools;
+using CalendarMcp.Core.Utilities;
 using Ical.Net;
 using Ical.Net.CalendarComponents;
 using Ical.Net.DataTypes;
@@ -13,20 +16,49 @@ using ModelCalendarEvent = CalendarMcp.Core.Models.CalendarEvent;
 namespace CalendarMcp.Core.Providers.Dav;
 
 /// <summary>
+/// One VEVENT, or one occurrence of a recurring VEVENT, from a calendar object resource.
+/// <see cref="RecurrenceKey"/> identifies the occurrence within its series and is null for
+/// non-recurring events.
+/// </summary>
+public readonly record struct ExpandedEvent(IcsCalendarEvent Event, Occurrence? Occurrence, string? RecurrenceKey);
+
+/// <summary>
 /// Maps between Ical.Net VEVENT components and Adjutant's <see cref="ModelCalendarEvent"/>.
 /// </summary>
-public static class IcalMapper
+public static partial class IcalMapper
 {
+    /// <summary>
+    /// Most occurrences one recurring event may expand to in a single query. Ical.Net 4.3.1
+    /// materializes every occurrence in the range, so a rule such as FREQ=MINUTELY over a
+    /// broad range is rejected before expansion rather than exhausting memory.
+    /// </summary>
+    internal const int MaxOccurrencesPerEvent = 10_000;
+
+    private const string UtcKeyFormat = "yyyyMMdd'T'HHmmss'Z'";
+    private const string DateKeyFormat = "yyyyMMdd";
+
     public static ModelCalendarEvent ToCalendarEvent(
         IcsCalendarEvent icsEvent,
         string accountId,
         string calendarId,
         string eventId,
-        Occurrence? occurrence = null)
+        Occurrence? occurrence = null,
+        string? ownerEmail = null)
     {
         DateTimeOffset evtStart, evtEnd;
+        DateOnly? startDate = null, endDate = null;
 
-        if (occurrence is not null)
+        if (icsEvent.IsAllDay)
+        {
+            // All-day (VALUE=DATE) events are floating dates: keep the date as written rather
+            // than anchoring it to an instant, which would shift it in zones behind UTC.
+            var (s, e) = IcsProviderService.GetAllDayDates(icsEvent, occurrence);
+            startDate = s;
+            endDate = e;
+            evtStart = TimeZoneHelper.UtcMidnight(s);
+            evtEnd = TimeZoneHelper.UtcMidnight(e);
+        }
+        else if (occurrence is not null)
         {
             evtStart = new DateTimeOffset(occurrence.Period.StartTime.AsUtc, TimeSpan.Zero);
             var occEnd = occurrence.Period.EndTime?.AsUtc
@@ -44,6 +76,7 @@ public static class IcalMapper
                 : evtStart;
         }
 
+        var organizer = ExtractMailto(icsEvent.Organizer?.Value);
         var attendees = new List<string>();
         var attendeeDetails = new List<EventAttendee>();
         foreach (var att in icsEvent.Attendees)
@@ -63,7 +96,8 @@ public static class IcalMapper
                     "OPT-PARTICIPANT" => "optional",
                     "NON-PARTICIPANT" => "resource",
                     _ => "required"
-                }
+                },
+                IsOrganizer = organizer.Length > 0 && email.Equals(organizer, StringComparison.OrdinalIgnoreCase)
             });
         }
 
@@ -75,13 +109,16 @@ public static class IcalMapper
             Subject = icsEvent.Summary ?? string.Empty,
             Start = evtStart,
             End = evtEnd,
+            StartDate = startDate,
+            EndDate = endDate,
             Location = icsEvent.Location ?? string.Empty,
             Body = icsEvent.Description ?? string.Empty,
             BodyFormat = "text",
-            Organizer = ExtractMailto(icsEvent.Organizer?.Value),
+            Organizer = organizer,
             OrganizerName = icsEvent.Organizer?.CommonName ?? string.Empty,
             Attendees = attendees,
             AttendeeDetails = attendeeDetails,
+            ResponseStatus = GetSelfResponseStatus(icsEvent, ownerEmail),
             IsAllDay = icsEvent.IsAllDay,
             ShowAs = icsEvent.Transparency == TransparencyType.Transparent ? "free" : "busy",
             Sensitivity = icsEvent.Class?.ToUpperInvariant() switch
@@ -91,7 +128,7 @@ public static class IcalMapper
                 _ => "normal"
             },
             IsCancelled = icsEvent.Status?.Equals("CANCELLED", StringComparison.OrdinalIgnoreCase) == true,
-            IsRecurring = icsEvent.RecurrenceRules?.Count > 0 || icsEvent.RecurrenceDates?.Count > 0,
+            IsRecurring = IsRecurring(icsEvent) || icsEvent.RecurrenceId is not null,
             RecurrencePattern = icsEvent.RecurrenceRules?.FirstOrDefault()?.ToString(),
             Categories = icsEvent.Categories?.ToList() ?? [],
             CreatedDateTime = icsEvent.Created?.AsUtc,
@@ -99,23 +136,217 @@ public static class IcalMapper
         };
     }
 
-    public static IEnumerable<(IcsCalendarEvent Master, Occurrence? Occurrence)> ExpandInRange(
-        IcalCalendar calendar, DateTime start, DateTime end)
+    /// <summary>
+    /// The account owner's own response: the PARTSTAT on their ATTENDEE entry, or accepted when
+    /// they organized the event or it is a personal appointment with no attendees or organizer.
+    /// </summary>
+    internal static string GetSelfResponseStatus(IcsCalendarEvent icsEvent, string? ownerEmail)
     {
+        var organizer = ExtractMailto(icsEvent.Organizer?.Value);
+        if (!string.IsNullOrWhiteSpace(ownerEmail))
+        {
+            if (organizer.Equals(ownerEmail, StringComparison.OrdinalIgnoreCase))
+                return "accepted";
+
+            var self = icsEvent.Attendees.FirstOrDefault(a =>
+                ExtractMailto(a.Value).Equals(ownerEmail, StringComparison.OrdinalIgnoreCase));
+            if (self is not null)
+                return MapPartStat(self.ParticipationStatus);
+        }
+
+        return icsEvent.Attendees.Count == 0 && organizer.Length == 0 ? "accepted" : "notResponded";
+    }
+
+    /// <summary>
+    /// Expands a calendar object resource into events and occurrences that may overlap
+    /// [<paramref name="windowStartUtc"/>, <paramref name="windowEndUtc"/>). Recurring events are
+    /// expanded with slack, so callers filter the mapped events by their UTC range. Overridden
+    /// occurrences (VEVENTs with RECURRENCE-ID) replace the master's generated occurrence.
+    /// </summary>
+    public static IEnumerable<ExpandedEvent> Expand(
+        IcalCalendar calendar, DateTime windowStartUtc, DateTime windowEndUtc,
+        CancellationToken cancellationToken = default)
+    {
+        var overrideKeys = calendar.Events
+            .Where(e => e.RecurrenceId is not null)
+            .Select(e => (e.Uid, Key: RecurrenceKey(e.RecurrenceId)))
+            .ToHashSet();
+
         foreach (var evt in calendar.Events)
         {
-            if (evt.RecurrenceRules?.Count > 0 || evt.RecurrenceDates?.Count > 0)
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (evt.RecurrenceId is not null)
             {
-                foreach (var occurrence in evt.GetOccurrences(new CalDateTime(start), new CalDateTime(end)))
-                    yield return (evt, occurrence);
+                yield return new ExpandedEvent(evt, null, RecurrenceKey(evt.RecurrenceId));
+            }
+            else if (IsRecurring(evt))
+            {
+                // Ical.Net 4.3.1 selects occurrences by wall-clock time in the event's own zone and
+                // ignores the bounds' zone, which can be off by up to 14h, so expand with a day of
+                // slack (plus the event's length, to catch occurrences that start before the window).
+                var length = evt.DtStart is not null && evt.DtEnd is not null
+                    ? evt.DtEnd.AsUtc - evt.DtStart.AsUtc
+                    : TimeSpan.Zero;
+                var from = windowStartUtc.AddDays(-1) - (length > TimeSpan.Zero ? length : TimeSpan.Zero);
+                var to = windowEndUtc.AddDays(1);
+                EnsureExpansionIsBounded(evt, from, to);
+
+                foreach (var occurrence in evt.GetOccurrences(new CalDateTime(from, "UTC"), new CalDateTime(to, "UTC")))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var key = RecurrenceKey(occurrence.Period.StartTime);
+                    if (!overrideKeys.Contains((evt.Uid, key)))
+                        yield return new ExpandedEvent(evt, occurrence, key);
+                }
             }
             else
             {
-                var evtStart = evt.DtStart?.AsUtc ?? DateTime.MinValue;
-                var evtEnd = evt.DtEnd?.AsUtc ?? evtStart;
-                if (evtStart < end && evtEnd > start)
-                    yield return (evt, null);
+                yield return new ExpandedEvent(evt, null, null);
             }
+        }
+    }
+
+    /// <summary>
+    /// Finds one occurrence of a recurring event by its <see cref="ExpandedEvent.RecurrenceKey"/>:
+    /// the override VEVENT when there is one, otherwise the master's generated occurrence.
+    /// Returns null when the series has no such occurrence (e.g. it was excluded).
+    /// </summary>
+    public static ExpandedEvent? FindOccurrence(IcalCalendar calendar, string recurrenceKey)
+    {
+        if (!TryParseRecurrenceKey(recurrenceKey, out var instant, out _))
+            return null;
+
+        foreach (var expanded in Expand(calendar, instant, instant.AddDays(1)))
+        {
+            if (expanded.RecurrenceKey == recurrenceKey)
+                return expanded;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Removes one occurrence from a recurring calendar object: adds an EXDATE to the master and
+    /// drops any override for that occurrence. Returns null when no VEVENT is left, in which case
+    /// the caller deletes the resource.
+    /// </summary>
+    public static string? ExcludeOccurrence(string existingIcs, string recurrenceKey)
+    {
+        if (!TryParseRecurrenceKey(recurrenceKey, out var instant, out var isDate))
+            throw new ProviderOperationException("The event id names an occurrence that is not valid.");
+
+        var calendar = IcalCalendar.Load(existingIcs)
+            ?? throw new InvalidOperationException("Failed to parse existing calendar data.");
+
+        foreach (var overridden in calendar.Events
+                     .Where(e => e.RecurrenceId is not null && RecurrenceKey(e.RecurrenceId) == recurrenceKey)
+                     .ToList())
+        {
+            calendar.Events.Remove(overridden);
+        }
+
+        var master = calendar.Events.FirstOrDefault(e => e.RecurrenceId is null && IsRecurring(e));
+        if (master is not null)
+        {
+            var excluded = ToExceptionDate(master.DtStart, instant, isDate);
+            // The TZID parameter is serialized from the list, not from its dates.
+            var exceptionDates = new PeriodList { TzId = excluded.TzId };
+            exceptionDates.Add(excluded);
+            master.ExceptionDates.Add(exceptionDates);
+            master.LastModified = new CalDateTime(DateTime.UtcNow);
+        }
+
+        return calendar.Events.Count == 0
+            ? null
+            : Serialize(calendar);
+    }
+
+    /// <summary>
+    /// An EXDATE in the same form as the series' DTSTART (date, UTC, zoned or floating).
+    /// Ical.Net 4.3.1 only excludes an occurrence whose EXDATE is written in the DTSTART's zone.
+    /// </summary>
+    private static IDateTime ToExceptionDate(IDateTime? seriesStart, DateTime instantUtc, bool isDate)
+    {
+        if (isDate)
+            return new CalDateTime(instantUtc.Year, instantUtc.Month, instantUtc.Day) { HasTime = false };
+        if (seriesStart is null || seriesStart.IsUtc)
+            return new CalDateTime(instantUtc, "UTC");
+
+        var tzId = seriesStart.TzId;
+        if (string.IsNullOrWhiteSpace(tzId))
+            return new CalDateTime(DateTime.SpecifyKind(instantUtc.ToLocalTime(), DateTimeKind.Unspecified));
+
+        var zone = TimeZoneHelper.TryGetTimeZone(tzId);
+        return zone is null
+            ? new CalDateTime(instantUtc, "UTC")
+            : new CalDateTime(TimeZoneInfo.ConvertTimeFromUtc(instantUtc, zone), tzId);
+    }
+
+    /// <summary>
+    /// Identifies one occurrence in its series: the UTC start instant, or the date for all-day
+    /// series. Matches the RECURRENCE-ID an override would carry for that occurrence.
+    /// </summary>
+    public static string RecurrenceKey(IDateTime start) =>
+        start.HasTime
+            ? start.AsUtc.ToString(UtcKeyFormat, CultureInfo.InvariantCulture)
+            : start.Value.ToString(DateKeyFormat, CultureInfo.InvariantCulture);
+
+    internal static bool TryParseRecurrenceKey(string key, out DateTime instantUtc, out bool isDate)
+    {
+        isDate = key.Length == DateKeyFormat.Length;
+        var ok = DateTime.TryParseExact(key, isDate ? DateKeyFormat : UtcKeyFormat, CultureInfo.InvariantCulture,
+            DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal, out instantUtc);
+        instantUtc = DateTime.SpecifyKind(instantUtc, DateTimeKind.Utc);
+        return ok;
+    }
+
+    private static bool IsRecurring(IcsCalendarEvent evt) =>
+        evt.RecurrenceRules?.Count > 0 || evt.RecurrenceDates?.Count > 0;
+
+    /// <summary>
+    /// Throws when a recurring event could expand to more than <see cref="MaxOccurrencesPerEvent"/>
+    /// occurrences between <paramref name="from"/> and <paramref name="to"/>. The estimate is an
+    /// upper bound: each BY* list is assumed to multiply the occurrences in a period.
+    /// </summary>
+    private static void EnsureExpansionIsBounded(IcsCalendarEvent evt, DateTime from, DateTime to)
+    {
+        if (evt.DtStart is not null && evt.DtStart.AsUtc > from)
+            from = evt.DtStart.AsUtc;
+
+        double estimate = evt.RecurrenceDates?.Sum(p => p.Count) ?? 0;
+        foreach (var rule in evt.RecurrenceRules ?? [])
+        {
+            var ruleEnd = rule.Until != DateTime.MinValue && rule.Until < to ? rule.Until : to;
+            if (ruleEnd <= from)
+                continue;
+
+            var step = rule.Frequency switch
+            {
+                FrequencyType.Secondly => TimeSpan.FromSeconds(1),
+                FrequencyType.Minutely => TimeSpan.FromMinutes(1),
+                FrequencyType.Hourly => TimeSpan.FromHours(1),
+                FrequencyType.Weekly => TimeSpan.FromDays(7),
+                FrequencyType.Monthly => TimeSpan.FromDays(28),
+                FrequencyType.Yearly => TimeSpan.FromDays(365),
+                _ => TimeSpan.FromDays(1)
+            } * Math.Max(1, rule.Interval);
+
+            double perPeriod = 1;
+            foreach (var count in new[] { rule.BySecond.Count, rule.ByMinute.Count, rule.ByHour.Count, rule.ByDay.Count,
+                         rule.ByMonthDay.Count, rule.ByYearDay.Count, rule.ByWeekNo.Count, rule.ByMonth.Count })
+            {
+                perPeriod *= Math.Max(1, count);
+            }
+
+            var ruleEstimate = (Math.Ceiling((ruleEnd - from) / step) + 1) * perPeriod;
+            estimate += rule.Count > 0 ? Math.Min(ruleEstimate, rule.Count) : ruleEstimate;
+        }
+
+        if (estimate > MaxOccurrencesPerEvent)
+        {
+            throw new ProviderOperationException(
+                $"A recurring event in this calendar repeats too often to list over this date range " +
+                $"(more than {MaxOccurrencesPerEvent:N0} occurrences); narrow startDate and endDate.");
         }
     }
 
@@ -171,7 +402,8 @@ public static class IcalMapper
         }
 
         calendar.Events.Add(evt);
-        return new CalendarSerializer().SerializeToString(calendar) ?? string.Empty;
+        AddMissingTimeZones(calendar, evt);
+        return Serialize(calendar);
     }
 
     public static string ApplyUpdates(
@@ -186,7 +418,7 @@ public static class IcalMapper
     {
         var calendar = IcalCalendar.Load(existingIcs)
             ?? throw new InvalidOperationException("Failed to parse existing calendar data.");
-        var evt = calendar.Events.FirstOrDefault()
+        var evt = GetPrimaryEvent(calendar)
             ?? throw new InvalidOperationException("Existing calendar object has no VEVENT.");
 
         if (subject is not null)
@@ -222,7 +454,8 @@ public static class IcalMapper
         }
 
         evt.LastModified = new CalDateTime(DateTime.UtcNow);
-        return new CalendarSerializer().SerializeToString(calendar) ?? string.Empty;
+        AddMissingTimeZones(calendar, evt);
+        return Serialize(calendar);
     }
 
     private static CalDateTime ToEventDateTime(DateTime value, bool isAllDay, string? timeZone)
@@ -234,11 +467,44 @@ public static class IcalMapper
             : new CalDateTime(value, timeZone);
     }
 
+    /// <summary>
+    /// CalDAV servers require a VTIMEZONE for every TZID a calendar object references
+    /// (RFC 4791 §4.1), so add one for any zone the event uses that the object lacks.
+    /// </summary>
+    private static void AddMissingTimeZones(IcalCalendar calendar, IcsCalendarEvent evt)
+    {
+        if (evt.IsAllDay)
+            return;
+
+        foreach (var dt in new[] { evt.DtStart, evt.DtEnd })
+        {
+            var tzId = dt?.TzId;
+            if (dt is null || string.IsNullOrWhiteSpace(tzId) || dt.IsUtc
+                || calendar.TimeZones.Any(t => string.Equals(t.TzId, tzId, StringComparison.OrdinalIgnoreCase)))
+            {
+                continue;
+            }
+
+            VTimeZone vtz;
+            try
+            {
+                vtz = VTimeZone.FromDateTimeZone(tzId, dt.Value.AddYears(-1), includeHistoricalData: false);
+            }
+            catch (Exception ex)
+            {
+                throw new ProviderOperationException(
+                    $"timeZone \"{ProviderErrorFormatter.Sanitize(tzId)}\" is not a recognized time zone; " +
+                    "use an IANA name such as America/Chicago.", ex);
+            }
+            calendar.AddTimeZone(vtz);
+        }
+    }
+
     public static string ApplyPartStat(string existingIcs, string attendeeEmail, string response)
     {
         var calendar = IcalCalendar.Load(existingIcs)
             ?? throw new InvalidOperationException("Failed to parse existing calendar data.");
-        var evt = calendar.Events.FirstOrDefault()
+        var evt = GetPrimaryEvent(calendar)
             ?? throw new InvalidOperationException("Existing calendar object has no VEVENT.");
 
         var partStat = response.ToLowerInvariant() switch
@@ -263,11 +529,64 @@ public static class IcalMapper
 
         attendee.ParticipationStatus = partStat;
         evt.LastModified = new CalDateTime(DateTime.UtcNow);
-        return new CalendarSerializer().SerializeToString(calendar) ?? string.Empty;
+        return Serialize(calendar);
     }
+
+    /// <summary>
+    /// Serializes a calendar for a PUT. Ical.Net 4.3.1 writes every date-valued EXDATE/RDATE as
+    /// a PERIOD ("20261006/P1D"), which RFC 5545 doesn't allow for EXDATE and servers may reject
+    /// or misread, so those lines are rewritten as plain VALUE=DATE lists.
+    /// </summary>
+    internal static string Serialize(IcalCalendar calendar)
+    {
+        var ics = new CalendarSerializer().SerializeToString(calendar) ?? string.Empty;
+        return DateListLine().Replace(ics, match =>
+        {
+            var line = match.Value.Replace("\r\n ", "").Replace("\r\n\t", "");
+            var colon = line.IndexOf(':');
+            var values = line[(colon + 1)..].Split(',');
+            if (!values.All(v => DatePeriodValue().IsMatch(v)))
+                return match.Value;
+
+            var parameters = line[..colon].Split(';')
+                .Where(p => !p.StartsWith("TZID=", StringComparison.OrdinalIgnoreCase)
+                            && !p.StartsWith("VALUE=", StringComparison.OrdinalIgnoreCase));
+            var fixedLine = string.Join(";", parameters) + ";VALUE=DATE:" + string.Join(",", values.Select(v => v[..8]));
+            return Fold(fixedLine);
+        });
+    }
+
+    /// <summary>
+    /// Folds a content line at 75 octets (RFC 5545 §3.1). The lines rewritten here are ASCII.
+    /// </summary>
+    private static string Fold(string line)
+    {
+        if (line.Length <= 75)
+            return line;
+
+        var sb = new StringBuilder(line[..75]);
+        for (var i = 75; i < line.Length; i += 74)
+            sb.Append("\r\n ").Append(line[i..Math.Min(i + 74, line.Length)]);
+        return sb.ToString();
+    }
+
+    /// <summary>An EXDATE or RDATE content line, including folded continuation lines.</summary>
+    [GeneratedRegex(@"^(?:EXDATE|RDATE)[;:](?:[^\r\n]|\r\n[ \t])*", RegexOptions.Multiline | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex DateListLine();
+
+    /// <summary>A date value, optionally serialized as a period: 20261006 or 20261006/P1D.</summary>
+    [GeneratedRegex(@"^\d{8}(?:/P[0-9A-Z]+)?$", RegexOptions.CultureInvariant)]
+    private static partial Regex DatePeriodValue();
 
     public static IcalCalendar? LoadCalendar(string? ics) =>
         string.IsNullOrWhiteSpace(ics) ? null : IcalCalendar.Load(ics);
+
+    /// <summary>
+    /// The VEVENT that represents the whole resource: the series master when the object also
+    /// holds overridden occurrences.
+    /// </summary>
+    public static IcsCalendarEvent? GetPrimaryEvent(IcalCalendar calendar) =>
+        calendar.Events.FirstOrDefault(e => e.RecurrenceId is null) ?? calendar.Events.FirstOrDefault();
 
     private static string MapPartStat(string? partStat) => partStat?.ToUpperInvariant() switch
     {
@@ -311,7 +630,8 @@ public static partial class VCardMapper
         foreach (var line in lines)
         {
             var (name, paramsPart, value) = SplitLine(line);
-            var upper = name.ToUpperInvariant();
+            // Grouped properties (item1.EMAIL, item1.TEL, ...) carry the group as a prefix.
+            var upper = name.Split('.').Last().ToUpperInvariant();
 
             switch (upper)
             {
@@ -319,7 +639,7 @@ public static partial class VCardMapper
                     displayName = Unescape(value);
                     break;
                 case "N":
-                    var parts = value.Split(';');
+                    var parts = SplitStructured(value);
                     surname = Unescape(parts.ElementAtOrDefault(0) ?? "");
                     given = Unescape(parts.ElementAtOrDefault(1) ?? "");
                     break;
@@ -341,7 +661,7 @@ public static partial class VCardMapper
                     job = Unescape(value);
                     break;
                 case "ORG":
-                    company = Unescape(value.Split(';')[0]);
+                    company = Unescape(SplitStructured(value)[0]);
                     break;
                 case "NOTE":
                     notes = Unescape(value);
@@ -352,7 +672,7 @@ public static partial class VCardMapper
                         birthday = bd.Date;
                     break;
                 case "ADR":
-                    var adr = value.Split(';');
+                    var adr = SplitStructured(value);
                     addresses.Add(new ContactAddress
                     {
                         Street = Unescape(adr.ElementAtOrDefault(2) ?? ""),
@@ -525,8 +845,27 @@ public static partial class VCardMapper
     private static string Escape(string value) =>
         value.Replace("\r\n", "\n").Replace("\r", "\n").Replace("\\", "\\\\").Replace("\n", "\\n").Replace(",", "\\,").Replace(";", "\\;");
 
-    private static string Unescape(string value) =>
-        value.Replace("\\n", "\n").Replace("\\N", "\n").Replace("\\,", ",").Replace("\\;", ";").Replace("\\\\", "\\");
+    /// <summary>
+    /// Reverses <see cref="Escape"/> in one pass, so an escaped backslash followed by "n"
+    /// stays a backslash and an "n" rather than becoming a newline.
+    /// </summary>
+    private static string Unescape(string value)
+    {
+        var sb = new StringBuilder(value.Length);
+        for (var i = 0; i < value.Length; i++)
+        {
+            if (value[i] == '\\' && i + 1 < value.Length)
+            {
+                var next = value[++i];
+                sb.Append(next is 'n' or 'N' ? '\n' : next);
+            }
+            else
+            {
+                sb.Append(value[i]);
+            }
+        }
+        return sb.ToString();
+    }
 
     [GeneratedRegex(@"TYPE=([^;]+)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex TypeParam();

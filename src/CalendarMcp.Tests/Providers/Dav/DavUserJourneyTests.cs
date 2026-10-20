@@ -51,7 +51,7 @@ public class DavUserJourneyTests
         StringAssert.Contains(payload, extras);
         StringAssert.Contains(payload, "NOTE:Note\\nEMAIL:injected@example.com\\nNext\\nLast");
         Assert.AreEqual("Renamed", (await provider.GetContactDetailsAsync("a", id))!.DisplayName);
-        Assert.AreEqual(1, VCardMapper.ToContact(payload, "a", id, null).EmailAddresses.Count);
+        Assert.AreEqual(2, VCardMapper.ToContact(payload, "a", id, null).EmailAddresses.Count);
         await provider.DeleteContactAsync("a", id);
         Assert.IsNull(await provider.GetContactDetailsAsync("a", id));
         Assert.IsTrue(server.Writes.All(w => w.ContentType == "text/vcard; charset=utf-8"));
@@ -76,7 +76,7 @@ public class DavUserJourneyTests
             () => provider.UpdateContactAsync("a", contact, displayName: "Bad"),
             () => provider.DeleteContactAsync("a", contact)
         ];
-        foreach (var attempt in attempts) await Assert.ThrowsExceptionAsync<InvalidOperationException>(attempt);
+        foreach (var attempt in attempts) await Assert.ThrowsExceptionAsync<ProviderOperationException>(attempt);
         Assert.IsFalse(server.RequestPaths.Any(p => p.StartsWith("/b/")));
     }
 
@@ -88,7 +88,7 @@ public class DavUserJourneyTests
     public async Task ForgedEventPath_IsRejected(string href)
     {
         using var server = new Server();
-        await Assert.ThrowsExceptionAsync<InvalidOperationException>(() => server.Provider().DeleteEventAsync(
+        await Assert.ThrowsExceptionAsync<ProviderOperationException>(() => server.Provider().DeleteEventAsync(
             "a", DavResourceId.Encode("https://dav.example/a/cal/rw/"), DavResourceId.Encode(href)));
         Assert.IsFalse(server.RequestMethods.Contains("DELETE"));
     }
@@ -110,7 +110,7 @@ public class DavUserJourneyTests
         using var server = new Server { ReadOnly = true };
         var provider = server.Provider();
         await Assert.ThrowsExceptionAsync<InvalidOperationException>(() => provider.CreateContactAsync("a", "Alice"));
-        await Assert.ThrowsExceptionAsync<InvalidOperationException>(() => provider.CreateEventAsync("a", null, "Trip", DateTime.UtcNow, DateTime.UtcNow.AddHours(1)));
+        await Assert.ThrowsExceptionAsync<ProviderOperationException>(() => provider.CreateEventAsync("a", null, "Trip", DateTime.UtcNow, DateTime.UtcNow.AddHours(1)));
         Assert.AreEqual(0, server.Writes.Count);
     }
 
@@ -204,6 +204,135 @@ public class DavUserJourneyTests
         StringAssert.Contains(updated, "NOTE:\r\n");
     }
 
+    private const string DailySeries =
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VEVENT\r\nUID:series-1\r\n" +
+        "DTSTAMP:20261001T000000Z\r\nDTSTART:20261005T150000Z\r\nDTEND:20261005T160000Z\r\n" +
+        "RRULE:FREQ=DAILY;COUNT=5\r\nSUMMARY:Standup\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+    [TestMethod]
+    public async Task RecurringOccurrence_HasItsOwnIdAndDeletingItKeepsTheSeries()
+    {
+        using var server = new Server();
+        server.Resources["/a/cal/rw/series.ics"] = DailySeries;
+        var provider = server.Provider();
+        var from = new DateTime(2026, 10, 1);
+        var to = new DateTime(2026, 10, 15);
+
+        var events = (await provider.GetCalendarEventsAsync("a", null, from, to)).ToList();
+        Assert.AreEqual(5, events.Count);
+        Assert.AreEqual(5, events.Select(e => e.Id).Distinct().Count());
+        var third = events[2];
+        Assert.AreEqual(new DateTimeOffset(2026, 10, 7, 15, 0, 0, TimeSpan.Zero), third.Start);
+        Assert.AreEqual(third.Start, (await provider.GetCalendarEventDetailsAsync("a", "primary", third.Id))!.Start);
+
+        // Changing one occurrence isn't supported, so it must not silently change the series.
+        await Assert.ThrowsExceptionAsync<ProviderOperationException>(
+            () => provider.UpdateEventAsync("a", "primary", third.Id, subject: "Moved"));
+        await Assert.ThrowsExceptionAsync<ProviderOperationException>(
+            () => provider.RespondToEventAsync("a", "primary", third.Id, "accept"));
+        Assert.AreEqual(0, server.Writes.Count);
+
+        await provider.DeleteEventAsync("a", "primary", third.Id);
+        Assert.IsFalse(server.RequestMethods.Contains("DELETE"));
+        Assert.AreEqual("\"v1\"", server.Writes.Single().IfMatch);
+        var after = (await provider.GetCalendarEventsAsync("a", null, from, to)).ToList();
+        Assert.AreEqual(4, after.Count);
+        Assert.IsFalse(after.Any(e => e.Start == third.Start));
+        Assert.IsNull(await provider.GetCalendarEventDetailsAsync("a", "primary", third.Id));
+    }
+
+    [TestMethod]
+    public async Task DefaultCalendarAliases_ResolveForEveryCalendarOperation()
+    {
+        using var server = new Server();
+        var provider = server.Provider();
+        var rw = (await provider.ListCalendarsAsync("a")).Single(c => c.CanEdit);
+        var start = new DateTime(2026, 10, 5, 15, 0, 0);
+
+        var id = await provider.CreateEventAsync("a", "primary", "Sync", start, start.AddHours(1));
+        Assert.IsTrue(DavResourceId.Decode(id).AbsolutePath.StartsWith("/a/cal/rw/"));
+        Assert.AreEqual(1, (await provider.GetCalendarEventsAsync("a", "Primary", start.AddDays(-1), start.AddDays(1))).Count());
+        Assert.AreEqual(rw.Id, (await provider.GetCalendarEventDetailsAsync("a", "primary", id))!.CalendarId);
+        await provider.UpdateEventAsync("a", "default", id, subject: "Renamed");
+        await provider.RespondToEventAsync("a", "primary", id, "accept");
+        await provider.DeleteEventAsync("a", "primary", id);
+        Assert.IsNull(await provider.GetCalendarEventDetailsAsync("a", "primary", id));
+    }
+
+    [TestMethod]
+    public async Task UnknownCalendarId_FailsWithActionableMessage()
+    {
+        using var server = new Server();
+        var provider = server.Provider();
+        var list = await Assert.ThrowsExceptionAsync<ProviderOperationException>(
+            () => provider.GetCalendarEventsAsync("a", "work"));
+        StringAssert.Contains(list.Message, "list_calendars");
+        var create = await Assert.ThrowsExceptionAsync<ProviderOperationException>(
+            () => provider.CreateEventAsync("a", "work", "X", DateTime.UtcNow, DateTime.UtcNow.AddHours(1)));
+        StringAssert.Contains(create.Message, "list_calendars");
+        Assert.AreEqual(0, server.Writes.Count);
+    }
+
+    [TestMethod]
+    public async Task AllDayEvent_ListKeepsFloatingDates()
+    {
+        using var server = new Server();
+        var provider = server.Provider();
+        await provider.CreateEventAsync("a", null, "Trip", new DateTime(2026, 9, 27), new DateTime(2026, 9, 29), isAllDay: true);
+
+        var evt = (await provider.GetCalendarEventsAsync("a", null, new DateTime(2026, 9, 26), new DateTime(2026, 10, 1))).Single();
+        Assert.AreEqual(new DateOnly(2026, 9, 27), evt.StartDate);
+        Assert.AreEqual(new DateOnly(2026, 9, 29), evt.EndDate);
+        Assert.AreEqual(new DateTimeOffset(2026, 9, 27, 0, 0, 0, TimeSpan.Zero), evt.Start);
+        Assert.AreEqual(new DateTimeOffset(2026, 9, 29, 0, 0, 0, TimeSpan.Zero), evt.End);
+    }
+
+    [TestMethod]
+    public async Task EventWindow_TreatsUnspecifiedBoundsAsUtc()
+    {
+        using var server = new Server();
+        var provider = server.Provider();
+        var start = new DateTime(2026, 10, 5, 0, 30, 0, DateTimeKind.Utc);
+        await provider.CreateEventAsync("a", null, "Early", start, start.AddMinutes(30));
+
+        var events = await provider.GetCalendarEventsAsync("a", null,
+            new DateTime(2026, 10, 5, 0, 0, 0, DateTimeKind.Unspecified),
+            new DateTime(2026, 10, 5, 1, 0, 0, DateTimeKind.Unspecified));
+        Assert.AreEqual(1, events.Count());
+        Assert.IsTrue(server.Reports.All(r => r.Contains("time-range")));
+    }
+
+    [TestMethod]
+    public async Task EventList_ReportsTheOwnersResponse()
+    {
+        using var server = new Server();
+        server.Resources["/a/cal/rw/invite.ics"] =
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VEVENT\r\nUID:invite-1\r\n" +
+            "DTSTAMP:20261001T000000Z\r\nDTSTART:20261005T150000Z\r\nDTEND:20261005T160000Z\r\nSUMMARY:Review\r\n" +
+            "ORGANIZER:mailto:boss@example.com\r\nATTENDEE;PARTSTAT=ACCEPTED:mailto:boss@example.com\r\n" +
+            "ATTENDEE;PARTSTAT=TENTATIVE:mailto:a@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        var evt = (await server.Provider().GetCalendarEventsAsync("a", null, new DateTime(2026, 10, 5), new DateTime(2026, 10, 6))).Single();
+        Assert.AreEqual("tentative", evt.ResponseStatus);
+        Assert.IsTrue(evt.AttendeeDetails.Single(a => a.Email == "boss@example.com").IsOrganizer);
+        Assert.IsFalse(evt.AttendeeDetails.Single(a => a.Email == "a@example.com").IsOrganizer);
+    }
+
+    [TestMethod]
+    public async Task ContactListAndSearch_UseFilteredAddressbookQueryAndGroupedProperties()
+    {
+        using var server = new Server();
+        var provider = server.Provider();
+        var id = await provider.CreateContactAsync("a", "Alice", emailAddresses: ["alice@example.com"]);
+        var path = DavResourceId.Decode(id).AbsolutePath;
+        server.Resources[path] = server.Resources[path].Replace("END:VCARD", "item1.EMAIL;TYPE=HOME:home@example.com\r\nEND:VCARD");
+
+        Assert.AreEqual(2, (await provider.GetContactsAsync("a")).Single().EmailAddresses.Count);
+        Assert.AreEqual(id, (await provider.SearchContactsAsync("a", "home@example")).Single().Id);
+        var queries = server.Reports.Where(r => r.Contains("addressbook-query")).ToList();
+        Assert.IsTrue(queries.Count > 0);
+        Assert.IsTrue(queries.All(r => r.Contains("<c:filter")));
+    }
+
     private sealed class Server : HttpMessageHandler, IHttpClientFactory, IAccountRegistry
     {
         public bool ReadOnly, Shared, Discover, FailWrites;
@@ -215,7 +344,7 @@ public class DavUserJourneyTests
             ["calendarHomeSet"] = "https://dav.example/a/cal/", ["addressbookHomeSet"] = "https://dav.example/a/book/"
         });
         public Dictionary<string, string> Resources = new();
-        public List<string> RequestPaths = [], RequestMethods = [];
+        public List<string> RequestPaths = [], RequestMethods = [], Reports = [];
         public List<(string? ContentType, string? IfMatch)> Writes = [];
         public CaptureLogger Log = new();
         public HttpClient CreateClient(string name) => new(this, disposeHandler: false);
@@ -241,6 +370,14 @@ public class DavUserJourneyTests
                 var book = path.Contains("book");
                 var writable = Shared && !book ? "/shared/cal/" : path + "rw/";
                 return Xml(Collection(path + "ro/", book, false) + Collection(writable, book, !ReadOnly));
+            }
+            if (request.Method.Method == "REPORT")
+            {
+                var body = await request.Content!.ReadAsStringAsync(cancellationToken);
+                Reports.Add(body);
+                var data = body.Contains("addressbook-query") ? "a:address-data" : "c:calendar-data";
+                return Xml(string.Concat(Resources.Where(r => r.Key.StartsWith(path, StringComparison.Ordinal)).Select(r =>
+                    $"<d:response><d:href>{r.Key}</d:href><d:propstat><d:prop><d:getetag>\"v1\"</d:getetag><{data}><![CDATA[{r.Value}]]></{data}></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>")));
             }
             if (request.Method == HttpMethod.Put)
             {

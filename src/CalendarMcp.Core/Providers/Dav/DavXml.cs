@@ -94,6 +94,7 @@ public static class DavXml
             <d:getetag/>
             <c:address-data/>
           </d:prop>
+          <c:filter/>
         </c:addressbook-query>
         """;
 
@@ -226,6 +227,23 @@ public sealed record DavPropResponse(
     Uri? CalendarHomeSet,
     Uri? AddressbookHomeSet,
     string? Status);
+
+/// <summary>
+/// Tool-facing event IDs. A whole calendar object resource is its <see cref="DavResourceId"/>;
+/// one occurrence of a recurring event appends "." and its <see cref="IcalMapper.RecurrenceKey"/>.
+/// "." is outside the base64url alphabet, so the two parts never collide.
+/// </summary>
+public static class DavEventId
+{
+    public static string Format(Uri href, string? recurrenceKey) =>
+        recurrenceKey is null ? DavResourceId.Encode(href) : $"{DavResourceId.Encode(href)}.{recurrenceKey}";
+
+    public static (string ResourceId, string? RecurrenceKey) Parse(string eventId)
+    {
+        var dot = eventId.IndexOf('.');
+        return dot < 0 ? (eventId, null) : (eventId[..dot], eventId[(dot + 1)..]);
+    }
+}
 
 /// <summary>
 /// Opaque tool-facing IDs derived from DAV hrefs.

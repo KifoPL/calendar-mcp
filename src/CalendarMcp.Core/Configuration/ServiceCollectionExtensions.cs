@@ -40,11 +40,14 @@ public static class ServiceCollectionExtensions
         // Register HttpClient for ICS provider
         services.AddHttpClient("IcsProvider");
 
-        // DAV client follows redirects manually inside DavHttpClient.
+        // DAV client follows redirects manually inside DavHttpClient. The handler is pooled
+        // across accounts, so cookies are off: a session cookie set for one account must not
+        // ride along with another account's Basic credentials.
         services.AddHttpClient(DavHttpClient.HttpClientName)
             .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler
             {
-                AllowAutoRedirect = false
+                AllowAutoRedirect = false,
+                UseCookies = false
             });
 
         // Register HttpClient for unsubscribe requests

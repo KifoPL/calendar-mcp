@@ -164,8 +164,8 @@ public static class AccountCapabilities
 
         var caldavUrl = GetConfig(working, "caldavUrl");
         var carddavUrl = GetConfig(working, "carddavUrl");
-        var enableCalendar = ParseEnable(GetConfig(working, "enableCalendar"), !string.IsNullOrWhiteSpace(caldavUrl));
-        var enableContacts = ParseEnable(GetConfig(working, "enableContacts"), !string.IsNullOrWhiteSpace(carddavUrl));
+        var enableCalendar = Providers.Dav.DavHostPolicy.IsEnabled(GetConfig(working, "enableCalendar"), !string.IsNullOrWhiteSpace(caldavUrl));
+        var enableContacts = Providers.Dav.DavHostPolicy.IsEnabled(GetConfig(working, "enableContacts"), !string.IsNullOrWhiteSpace(carddavUrl));
 
         var capabilities = new List<AccountCapability>();
         if (enableCalendar)
@@ -194,11 +194,6 @@ public static class AccountCapabilities
             }
             return null;
         }
-
-        static bool ParseEnable(string? value, bool defaultValue) =>
-            value is null
-                ? defaultValue
-                : value.Equals("true", StringComparison.OrdinalIgnoreCase) || value == "1";
     }
 
     /// <summary>

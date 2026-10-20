@@ -250,11 +250,11 @@ else if (_model is not null)
                 </details>
                 break;
 
-            case "dav":
+            case "dav" or "caldav" or "carddav":
                 <div class="row">
                     <div class="col-md-4 mb-3">
                         <label class="form-label">Preset</label>
-                        <InputSelect class="form-select" @bind-Value="_model.DavPreset">
+                        <InputSelect class="form-select" @bind-Value="_model.DavPreset" @bind-Value:after="OnDavPresetChanged">
                             <option value="icloud">iCloud</option>
                             <option value="icloud-cn">iCloud (China)</option>
                             <option value="fastmail">Fastmail</option>
@@ -439,6 +439,8 @@ else if (_model is not null)
             _submitting = false;
         }
     }
+
+    private void OnDavPresetChanged() => _model?.ApplyDavPresetDefaults();
 
     private static bool HasEmailSupport(string provider) =>
         provider is "microsoft365" or "outlook.com" or "google";

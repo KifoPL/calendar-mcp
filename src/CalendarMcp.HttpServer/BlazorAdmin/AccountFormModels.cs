@@ -314,6 +314,27 @@ public class EditAccountFormModel : AccountFormBase
     public bool EnableCalendar { get; set; } = true;
     public bool EnableContacts { get; set; } = true;
 
+    // Discovery overrides aren't on the form. They are carried through an edit unless the
+    // connection they were discovered for (preset, username, service URL) changes.
+    private string _calendarHomeSet = "";
+    private string _addressbookHomeSet = "";
+    private string _loadedDavPreset = "";
+    private string _loadedUsername = "";
+    private string _loadedCalDavUrl = "";
+    private string _loadedCardDavUrl = "";
+
+    /// <summary>
+    /// Resets the service URLs to the selected preset's defaults (blank for presets without
+    /// fixed endpoints), so credentials typed for the new preset never go to the old host.
+    /// </summary>
+    public void ApplyDavPresetDefaults()
+    {
+        var config = new Dictionary<string, string>();
+        DavHostPolicy.ApplyPreset(DavPreset, config);
+        CalDavUrl = config.GetValueOrDefault("caldavUrl", "");
+        CardDavUrl = config.GetValueOrDefault("carddavUrl", "");
+    }
+
     public static EditAccountFormModel FromAccountInfo(AccountInfo account, PasswordProtector? passwordProtector = null)
     {
         var model = new EditAccountFormModel
@@ -383,26 +404,27 @@ public class EditAccountFormModel : AccountFormBase
                 if (string.IsNullOrEmpty(model.JunkFolder)) model.JunkFolder = ImapProviderService.DefaultJunk;
                 break;
             case "dav" or "caldav" or "carddav":
-                model.DavPreset = GetConfigValue(config, "preset");
-                if (string.IsNullOrEmpty(model.DavPreset)) model.DavPreset = DavHostPolicy.PresetGeneric;
-                model.CalDavUrl = GetConfigValue(config, "caldavUrl");
-                model.CardDavUrl = GetConfigValue(config, "carddavUrl");
+                // Load what the provider uses: preset defaults fill any URL the account leaves out.
+                var davConfig = new Dictionary<string, string>(config, StringComparer.OrdinalIgnoreCase);
+                DavHostPolicy.ApplyPreset(null, davConfig);
+                model.DavPreset = GetConfigValue(davConfig, "preset");
+                model.CalDavUrl = GetConfigValue(davConfig, "caldavUrl");
+                model.CardDavUrl = GetConfigValue(davConfig, "carddavUrl");
                 model.Username = GetConfigValue(config, "username");
                 var davPassword = GetConfigValue(config, "password");
                 model.Password = passwordProtector is not null
                     ? passwordProtector.Unprotect(davPassword)
                     : davPassword;
-                model.EnableCalendar = !string.Equals(GetConfigValue(config, "enableCalendar"), "false", StringComparison.OrdinalIgnoreCase);
-                model.EnableContacts = !string.Equals(GetConfigValue(config, "enableContacts"), "false", StringComparison.OrdinalIgnoreCase);
-                if (string.IsNullOrWhiteSpace(GetConfigValue(config, "enableCalendar")) && string.IsNullOrWhiteSpace(model.CalDavUrl))
-                    model.EnableCalendar = false;
-                if (string.IsNullOrWhiteSpace(GetConfigValue(config, "enableContacts")) && string.IsNullOrWhiteSpace(model.CardDavUrl))
-                    model.EnableContacts = false;
-                if (!model.EnableCalendar && !model.EnableContacts)
-                {
-                    model.EnableCalendar = !string.IsNullOrWhiteSpace(model.CalDavUrl);
-                    model.EnableContacts = !string.IsNullOrWhiteSpace(model.CardDavUrl);
-                }
+                model.EnableCalendar = DavHostPolicy.IsEnabled(
+                    GetConfigValue(config, "enableCalendar"), defaultValue: model.CalDavUrl.Length > 0);
+                model.EnableContacts = DavHostPolicy.IsEnabled(
+                    GetConfigValue(config, "enableContacts"), defaultValue: model.CardDavUrl.Length > 0);
+                model._calendarHomeSet = GetConfigValue(config, "calendarHomeSet");
+                model._addressbookHomeSet = GetConfigValue(config, "addressbookHomeSet");
+                model._loadedDavPreset = model.DavPreset;
+                model._loadedUsername = model.Username;
+                model._loadedCalDavUrl = model.CalDavUrl;
+                model._loadedCardDavUrl = model.CardDavUrl;
                 break;
         }
 
@@ -478,6 +500,12 @@ public class EditAccountFormModel : AccountFormBase
             config.Remove("caldavUrl");
         if (!EnableContacts)
             config.Remove("carddavUrl");
+
+        var sameAccount = DavPreset == _loadedDavPreset && Username == _loadedUsername;
+        if (EnableCalendar && sameAccount && CalDavUrl == _loadedCalDavUrl && _calendarHomeSet.Length > 0)
+            config["calendarHomeSet"] = _calendarHomeSet;
+        if (EnableContacts && sameAccount && CardDavUrl == _loadedCardDavUrl && _addressbookHomeSet.Length > 0)
+            config["addressbookHomeSet"] = _addressbookHomeSet;
 
         return config;
     }
